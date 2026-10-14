@@ -1,4 +1,4 @@
 import { defineSetupPluginEntry } from "openclaw/plugin-sdk/channel-core";
-import { linqPlugin } from "./src/channel.js";
+import { linqSetupPlugin } from "./src/channel.setup.js";
 
-export default defineSetupPluginEntry(linqPlugin);
+export default defineSetupPluginEntry(linqSetupPlugin);

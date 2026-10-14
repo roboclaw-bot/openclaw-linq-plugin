@@ -23,12 +23,14 @@ describe("parseLinqTarget", () => {
   });
 
   it("formats normalized targets", () => {
-    expect(formatLinqTarget(parseLinqTarget("linq:sales:+1 (555) 666-7777"))).toBe(
-      "linq:sales:+15556667777",
-    );
+    expect(
+      formatLinqTarget(parseLinqTarget("linq:sales:+1 (555) 666-7777")),
+    ).toBe("linq:sales:+15556667777");
   });
 
   it("rejects invalid targets", () => {
-    expect(() => parseLinqTarget("not a target")).toThrow(/Invalid Linq target/u);
+    expect(() => parseLinqTarget("not a target")).toThrow(
+      /Invalid Linq target/u,
+    );
   });
 });

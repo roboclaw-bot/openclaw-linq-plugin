@@ -25,17 +25,30 @@ function normalizePhone(raw: string): string {
   return raw.replace(/[\s().-]/gu, "");
 }
 
-export function parseLinqTarget(rawTarget: string, defaultAccountId?: string): LinqTarget {
+export function parseLinqTarget(
+  rawTarget: string,
+  defaultAccountId?: string,
+): LinqTarget {
   const raw = rawTarget.trim();
   const target = raw.startsWith("linq:") ? raw.slice("linq:".length) : raw;
   const parts = target.split(":");
 
   if (parts[0] === "chat" && parts[1]) {
-    return { kind: "chat", chatId: parts.slice(1).join(":"), accountId: defaultAccountId, raw };
+    return {
+      kind: "chat",
+      chatId: parts.slice(1).join(":"),
+      accountId: defaultAccountId,
+      raw,
+    };
   }
 
   if (parts[0] === "group" && parts[1]) {
-    return { kind: "group", chatId: parts.slice(1).join(":"), accountId: defaultAccountId, raw };
+    return {
+      kind: "group",
+      chatId: parts.slice(1).join(":"),
+      accountId: defaultAccountId,
+      raw,
+    };
   }
 
   if (parts.length >= 2 && ACCOUNT_RE.test(parts[0] ?? "")) {

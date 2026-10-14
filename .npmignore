@@ -1,0 +1,10 @@
+.env
+.env.*
+.worktrees/
+.local/
+node_modules/
+tmp/
+*.tsbuildinfo
+**/*.test.ts
+LINQ-PARITY.md
+LINQ-PLAN.md

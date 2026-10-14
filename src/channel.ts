@@ -1,117 +1,37 @@
 import {
-  applyAccountNameToChannelSection,
   DEFAULT_ACCOUNT_ID,
-  deleteAccountFromConfigSection,
-  formatPairingApproveHint,
-  getChatChannelMeta,
-  buildChannelConfigSchema,
-  migrateBaseNameToDefaultAccount,
-  normalizeAccountId,
-  setAccountEnabledInConfigSection,
   type ChannelPlugin,
 } from "openclaw/plugin-sdk/core";
-import type { OpenClawConfig } from "openclaw/plugin-sdk";
+import type { LinqAccountConfig } from "./linq/types.js";
 import type { ResolvedLinqAccount } from "./linq/accounts.js";
 import type { LinqProbe } from "./linq/types.js";
-import { LinqConfigSchema } from "./linq/config.js";
-import {
-  listLinqAccountIds,
-  resolveDefaultLinqAccountId,
-  resolveLinqAccount,
-  resolveLinqAccountForStatus,
-} from "./linq/accounts.js";
+import { resolveLinqAccount } from "./linq/accounts.js";
 import { probeLinq } from "./linq/probe.js";
 import { sendMessageLinq } from "./linq/send.js";
-import { parseLinqTarget } from "./linq/targets.js";
-import { monitorLinqProvider } from "./linq/monitor.js";
-import { linqOnboardingAdapter } from "./onboarding.js";
-import { getLinqRuntime } from "./runtime.js";
+import { formatLinqTarget, parseLinqTarget } from "./linq/targets.js";
+import { monitorLinqProvider } from "./linq/gateway.js";
 import {
-  collectLinqRuntimeConfigAssignments,
-  linqSecretTargetRegistryEntries,
-} from "./linq/secret-contract.js";
-
-const meta = getChatChannelMeta("linq");
+  linqMessageAdapter,
+  toLinqOutboundDeliveryResult,
+} from "./linq/message.js";
+import { resolveLinqOutboundSessionRoute } from "./linq/session-route.js";
+import { getLinqRuntime } from "./runtime.js";
+import { createLinqPluginBase } from "./channel-base.js";
 
 export const linqPlugin: ChannelPlugin<ResolvedLinqAccount, LinqProbe> = {
-  id: "linq",
-  meta: {
-    ...meta,
-    aliases: ["linq-imessage"],
-  },
-  setupWizard: linqOnboardingAdapter as never,
+  ...createLinqPluginBase(),
   pairing: {
     idLabel: "phoneNumber",
     notifyApproval: async ({ id, accountId, cfg }) => {
       const account = resolveLinqAccount({ cfg, accountId });
-      await sendMessageLinq(`linq:${id}`, "Pairing approved. You can now message this agent.", {
-        account,
-        accountId: account.accountId,
-      });
-    },
-  },
-  capabilities: {
-    chatTypes: ["direct"],
-    reactions: false,
-    media: true,
-  },
-  reload: { configPrefixes: ["channels.linq"] },
-  configSchema: buildChannelConfigSchema(LinqConfigSchema),
-  config: {
-    listAccountIds: (cfg) => listLinqAccountIds(cfg),
-    resolveAccount: (cfg, accountId) => resolveLinqAccountForStatus({ cfg, accountId }),
-    defaultAccountId: (cfg) => resolveDefaultLinqAccountId(cfg),
-    setAccountEnabled: ({ cfg, accountId, enabled }) =>
-      setAccountEnabledInConfigSection({
-        cfg,
-        sectionKey: "linq",
-        accountId,
-        enabled,
-        allowTopLevel: true,
-      }),
-    deleteAccount: ({ cfg, accountId }) =>
-      deleteAccountFromConfigSection({
-        cfg,
-        sectionKey: "linq",
-        accountId,
-        clearBaseFields: ["apiToken", "tokenFile", "fromPhone", "name"],
-      }),
-    isConfigured: (account) => Boolean(account.token?.trim()),
-    describeAccount: (account) => ({
-      accountId: account.accountId,
-      name: account.name,
-      enabled: account.enabled,
-      configured: Boolean(account.token?.trim()),
-      tokenSource: account.tokenSource,
-      webhookSecretSource: account.webhookSecretSource,
-      fromPhone: account.fromPhone,
-    }),
-    resolveAllowFrom: ({ cfg, accountId }) =>
-      (resolveLinqAccountForStatus({ cfg, accountId }).config.allowFrom ?? []).map((entry) =>
-        String(entry),
-      ),
-    formatAllowFrom: ({ allowFrom }) =>
-      allowFrom.map((entry) => String(entry).trim()).filter(Boolean),
-  },
-  security: {
-    resolveDmPolicy: ({ cfg, accountId, account }) => {
-      const resolvedAccountId = accountId ?? account.accountId ?? DEFAULT_ACCOUNT_ID;
-      const linqSection = (cfg.channels as Record<string, unknown> | undefined)?.linq as
-        | Record<string, unknown>
-        | undefined;
-      const useAccountPath = Boolean(
-        (linqSection?.accounts as Record<string, unknown> | undefined)?.[resolvedAccountId],
+      await sendMessageLinq(
+        `linq:${id}`,
+        "Pairing approved. You can now message this agent.",
+        {
+          account,
+          accountId: account.accountId,
+        },
       );
-      const basePath = useAccountPath
-        ? `channels.linq.accounts.${resolvedAccountId}.`
-        : "channels.linq.";
-      return {
-        policy: account.config.dmPolicy ?? "open",
-        allowFrom: account.config.allowFrom ?? [],
-        policyPath: `${basePath}dmPolicy`,
-        allowFromPath: basePath,
-        approveHint: formatPairingApproveHint("linq"),
-      };
     },
   },
   messaging: {
@@ -120,16 +40,17 @@ export const linqPlugin: ChannelPlugin<ResolvedLinqAccount, LinqProbe> = {
         return "";
       }
       try {
-        return parseLinqTarget(raw).raw;
+        return formatLinqTarget(parseLinqTarget(raw));
       } catch {
         return raw;
       }
     },
+    resolveOutboundSessionRoute: (params) =>
+      resolveLinqOutboundSessionRoute(params),
     targetResolver: {
       looksLikeId: (id) => {
         try {
-          parseLinqTarget(id ?? "");
-          return true;
+          return parseLinqTarget(id ?? "").kind !== "group";
         } catch {
           return false;
         }
@@ -137,108 +58,44 @@ export const linqPlugin: ChannelPlugin<ResolvedLinqAccount, LinqProbe> = {
       hint: "linq:+15556667777 | linq:chat:<chat_id> | linq:<accountId>:+15556667777",
     },
   },
-  setup: {
-    resolveAccountId: ({ accountId }) => normalizeAccountId(accountId),
-    applyAccountName: ({ cfg, accountId, name }) =>
-      applyAccountNameToChannelSection({
-        cfg,
-        channelKey: "linq",
-        accountId,
-        name,
-      }),
-    validateInput: ({ accountId, input }) => {
-      if (input.useEnv && accountId !== DEFAULT_ACCOUNT_ID) {
-        return "LINQ_API_TOKEN can only be used for the default account.";
-      }
-      if (!input.useEnv && !input.token && !input.tokenFile) {
-        return "Linq requires an API token or --token-file (or --use-env).";
-      }
-      return null;
-    },
-    applyAccountConfig: ({ cfg, accountId, input }) => {
-      const namedConfig = applyAccountNameToChannelSection({
-        cfg,
-        channelKey: "linq",
-        accountId,
-        name: input.name,
-      });
-      const next =
-        accountId !== DEFAULT_ACCOUNT_ID
-          ? migrateBaseNameToDefaultAccount({ cfg: namedConfig, channelKey: "linq" })
-          : namedConfig;
-      if (accountId === DEFAULT_ACCOUNT_ID) {
-        return {
-          ...next,
-          channels: {
-            ...next.channels,
-            linq: {
-              ...((next.channels as Record<string, unknown> | undefined)?.linq as
-                | Record<string, unknown>
-                | undefined),
-              enabled: true,
-              ...(input.useEnv
-                ? {}
-                : input.tokenFile
-                  ? { tokenFile: input.tokenFile }
-                  : input.token
-                    ? { apiToken: input.token }
-                    : {}),
-            },
-          },
-        };
-      }
-      const linqSection = (next.channels as Record<string, unknown> | undefined)?.linq as
-        | Record<string, unknown>
-        | undefined;
-      return {
-        ...next,
-        channels: {
-          ...next.channels,
-          linq: {
-            ...linqSection,
-            enabled: true,
-            accounts: {
-              ...(linqSection?.accounts as Record<string, unknown> | undefined),
-              [accountId]: {
-                ...((linqSection?.accounts as Record<string, unknown> | undefined)?.[accountId] as
-                  | Record<string, unknown>
-                  | undefined),
-                enabled: true,
-                ...(input.tokenFile
-                  ? { tokenFile: input.tokenFile }
-                  : input.token
-                    ? { apiToken: input.token }
-                    : {}),
-              },
-            },
-          },
-        },
-      };
-    },
-  },
   outbound: {
     deliveryMode: "direct",
-    chunker: (text, limit) => getLinqRuntime().channel.text.chunkText(text, limit),
+    chunker: (text, limit) =>
+      getLinqRuntime().channel.text.chunkText(text, limit),
     chunkerMode: "text",
     textChunkLimit: 4000,
-    sendText: async ({ to, text, accountId }) => {
-      const cfg = getLinqRuntime().config.current() as OpenClawConfig;
+    sendText: async ({ to, text, accountId, cfg, replyToId }) => {
       const result = await sendMessageLinq(to, text, {
         accountId: accountId ?? undefined,
         config: cfg,
+        replyToMessageId: replyToId ?? undefined,
       });
-      return { channel: "linq", ...result };
+      return toLinqOutboundDeliveryResult(result, "text");
     },
-    sendMedia: async ({ to, text, mediaUrl, accountId }) => {
-      const cfg = getLinqRuntime().config.current() as OpenClawConfig;
+    sendMedia: async ({
+      to,
+      text,
+      mediaUrl,
+      accountId,
+      cfg,
+      replyToId,
+      mediaAccess,
+      mediaLocalRoots,
+      mediaReadFile,
+    }) => {
       const result = await sendMessageLinq(to, text, {
         mediaUrl,
+        mediaAccess,
+        mediaLocalRoots,
+        mediaReadFile,
         accountId: accountId ?? undefined,
         config: cfg,
+        replyToMessageId: replyToId ?? undefined,
       });
-      return { channel: "linq", ...result };
+      return toLinqOutboundDeliveryResult(result, "media");
     },
   },
+  message: linqMessageAdapter,
   status: {
     defaultRuntime: {
       accountId: DEFAULT_ACCOUNT_ID,
@@ -249,7 +106,8 @@ export const linqPlugin: ChannelPlugin<ResolvedLinqAccount, LinqProbe> = {
     },
     collectStatusIssues: (accounts) =>
       accounts.flatMap((account) => {
-        const lastError = typeof account.lastError === "string" ? account.lastError.trim() : "";
+        const lastError =
+          typeof account.lastError === "string" ? account.lastError.trim() : "";
         if (!lastError) {
           return [];
         }
@@ -266,7 +124,9 @@ export const linqPlugin: ChannelPlugin<ResolvedLinqAccount, LinqProbe> = {
       configured: snapshot.configured ?? false,
       tokenSource: snapshot.tokenSource ?? "none",
       webhookSecretSource:
-        ((snapshot as Record<string, unknown>).webhookSecretSource as string | undefined) ?? "none",
+        ((snapshot as Record<string, unknown>).webhookSecretSource as
+          | string
+          | undefined) ?? "none",
       running: snapshot.running ?? false,
       lastStartAt: snapshot.lastStartAt ?? null,
       lastStopAt: snapshot.lastStopAt ?? null,
@@ -280,7 +140,9 @@ export const linqPlugin: ChannelPlugin<ResolvedLinqAccount, LinqProbe> = {
       accountId: account.accountId,
       name: account.name,
       enabled: account.enabled,
-      configured: Boolean(account.token?.trim()),
+      configured: Boolean(
+        account.token?.trim() || account.tokenSource === "secretRef",
+      ),
       tokenSource: account.tokenSource,
       webhookSecretSource: account.webhookSecretSource,
       fromPhone: account.fromPhone,
@@ -292,10 +154,6 @@ export const linqPlugin: ChannelPlugin<ResolvedLinqAccount, LinqProbe> = {
       lastInboundAt: runtime?.lastInboundAt ?? null,
       lastOutboundAt: runtime?.lastOutboundAt ?? null,
     }),
-  },
-  secrets: {
-    secretTargetRegistryEntries: linqSecretTargetRegistryEntries,
-    collectRuntimeConfigAssignments: collectLinqRuntimeConfigAssignments,
   },
   gateway: {
     startAccount: async (ctx) => {
@@ -310,7 +168,9 @@ export const linqPlugin: ChannelPlugin<ResolvedLinqAccount, LinqProbe> = {
       } catch {
         // Probe failure is non-fatal for startup.
       }
-      ctx.log?.info(`[${account.accountId}] starting Linq provider${phoneLabel}`);
+      ctx.log?.info(
+        `[${account.accountId}] starting Linq provider${phoneLabel}`,
+      );
       return monitorLinqProvider({
         accountId: account.accountId,
         config: ctx.cfg,
@@ -318,65 +178,32 @@ export const linqPlugin: ChannelPlugin<ResolvedLinqAccount, LinqProbe> = {
         abortSignal: ctx.abortSignal,
       });
     },
-    logoutAccount: async ({ accountId, cfg }) => {
+    logoutAccount: async ({ accountId }) => {
       const rt = getLinqRuntime();
-      const nextCfg = { ...cfg };
-      const linqSection = (cfg.channels as Record<string, unknown> | undefined)?.linq as
-        | Record<string, unknown>
-        | undefined;
       let cleared = false;
-      let changed = false;
-      if (linqSection) {
-        const nextLinq = { ...linqSection };
-        if (accountId === DEFAULT_ACCOUNT_ID && nextLinq.apiToken) {
-          delete nextLinq.apiToken;
-          cleared = true;
-          changed = true;
-        }
-        const accounts =
-          nextLinq.accounts && typeof nextLinq.accounts === "object"
-            ? { ...(nextLinq.accounts as Record<string, unknown>) }
-            : undefined;
-        if (accounts && accountId in accounts) {
-          const entry = accounts[accountId];
-          if (entry && typeof entry === "object") {
-            const nextEntry = { ...(entry as Record<string, unknown>) };
-            if ("apiToken" in nextEntry) {
+      await rt.config.mutateConfigFile({
+        afterWrite: { mode: "auto" },
+        mutate: (draft) => {
+          const section = draft.channels?.linq as LinqAccountConfig | undefined;
+          const target =
+            section?.accounts?.[accountId] ??
+            (accountId === DEFAULT_ACCOUNT_ID ? section : undefined);
+          if (!target) return;
+          for (const key of [
+            "apiToken",
+            "tokenFile",
+            "webhookSecret",
+          ] as const) {
+            if (key in target) {
+              delete target[key];
               cleared = true;
-              delete nextEntry.apiToken;
-              changed = true;
-            }
-            if (Object.keys(nextEntry).length === 0) {
-              delete accounts[accountId];
-              changed = true;
-            } else {
-              accounts[accountId] = nextEntry;
             }
           }
-        }
-        if (accounts) {
-          if (Object.keys(accounts).length === 0) {
-            delete nextLinq.accounts;
-            changed = true;
-          } else {
-            nextLinq.accounts = accounts;
-          }
-        }
-        if (changed) {
-          if (Object.keys(nextLinq).length > 0) {
-            nextCfg.channels = { ...nextCfg.channels, linq: nextLinq } as typeof nextCfg.channels;
-          } else {
-            const nextChannels = { ...nextCfg.channels } as Record<string, unknown>;
-            delete nextChannels.linq;
-            nextCfg.channels = nextChannels as typeof nextCfg.channels;
-          }
-        }
-      }
-      if (changed) {
-        await rt.config.writeConfigFile(nextCfg);
-      }
-      const resolved = resolveLinqAccount({ cfg: changed ? nextCfg : cfg, accountId });
-      return { cleared, loggedOut: resolved.tokenSource === "none" };
+          // Revocation is account-scoped: inherited/env credentials must not reactivate it.
+          target.enabled = false;
+        },
+      });
+      return { cleared, loggedOut: true };
     },
   },
 };

@@ -1,63 +1,148 @@
+import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
+import { loadWebMediaRaw } from "openclaw/plugin-sdk/web-media";
+import {
+  buildOutboundMediaLoadOptions,
+  type OutboundMediaAccess,
+  type OutboundMediaReadFile,
+} from "openclaw/plugin-sdk/media-runtime";
+import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
+import {
+  resolveLinqAccount,
+  listLinqAccountIds,
+  type ResolvedLinqAccount,
+} from "./accounts.js";
+import { parseLinqTarget } from "./targets.js";
 import type { LinqSendResult } from "./types.js";
-import { resolveLinqAccount, type ResolvedLinqAccount } from "./accounts.js";
-import type { OpenClawConfig } from "openclaw/plugin-sdk";
-import { parseLinqTarget, type LinqTarget } from "./targets.js";
 
-const LINQ_API_BASE = "https://api.linqapp.com/api/partner/v3";
+const BASE = "https://api.linqapp.com/api/partner/v3";
 const UA = "OpenClaw-Linq/1.0";
-const MAX_RETRIES = 2;
-const RETRY_DELAY_MS = 500;
-
-async function fetchWithRetry(
-  url: string,
-  init: RequestInit,
-  retries = MAX_RETRIES,
-): Promise<Response> {
-  for (let attempt = 0; ; attempt++) {
-    const response = await fetch(url, init);
-    if (response.status === 429 && attempt < retries) {
-      const retryAfter = Number(response.headers.get("retry-after")) || 0;
-      const delay = retryAfter > 0 ? retryAfter * 1000 : RETRY_DELAY_MS * 2 ** attempt;
-      await new Promise((r) => setTimeout(r, Math.min(delay, 10_000)));
-      continue;
-    }
-    return response;
-  }
-}
 
 export type LinqSendOpts = {
+  mediaAccess?: OutboundMediaAccess;
+  mediaLocalRoots?: readonly string[];
+  mediaReadFile?: OutboundMediaReadFile;
   accountId?: string;
   mediaUrl?: string;
   replyToMessageId?: string;
-  verbose?: boolean;
   token?: string;
   config?: OpenClawConfig;
   account?: ResolvedLinqAccount;
   idempotencyKey?: string;
+  signal?: AbortSignal;
+  beforeSend?: () => Promise<void>;
+  assertCurrent?: () => void;
 };
 
-function buildSendUrl(target: LinqTarget, fromPhone?: string): string {
-  if (target.kind === "phone") {
-    if (!fromPhone?.trim()) {
-      throw new Error("Linq phone targets require fromPhone on the selected account");
+async function apiRequest(
+  path: string,
+  token: string,
+  body: unknown,
+  signal?: AbortSignal,
+  beforeAttempt?: () => Promise<void>,
+) {
+  const headers = {
+    Authorization: "Bearer " + token,
+    "Content-Type": "application/json",
+    "User-Agent": UA,
+  };
+  for (let attempt = 0; ; attempt++) {
+    signal?.throwIfAborted();
+    await beforeAttempt?.();
+    const response = await fetch(BASE + path, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      redirect: "error",
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(30_000)])
+        : AbortSignal.timeout(30_000),
+    });
+    if (response.status === 429 && attempt < 2) {
+      const retryAfter = response.headers.get("retry-after");
+      const seconds = Number(retryAfter);
+      const wait = retryAfter
+        ? Number.isFinite(seconds)
+          ? seconds * 1000
+          : Date.parse(retryAfter) - Date.now()
+        : 500 * 2 ** attempt;
+      await response.body?.cancel();
+      // Never retry earlier than the provider's requested time, or keep the host lane asleep unboundedly.
+      if (!Number.isFinite(wait) || wait > 10_000)
+        throw new Error(
+          "Linq rate limited; retry after " + (retryAfter ?? "later"),
+        );
+      await delay(Math.max(wait, 0), undefined, { signal });
+      continue;
     }
-    return `${LINQ_API_BASE}/chats`;
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new Error("Linq API request failed (HTTP " + response.status + ")");
+    }
+    return response.json() as Promise<Record<string, any>>;
   }
-  return `${LINQ_API_BASE}/chats/${encodeURIComponent(target.chatId)}/messages`;
 }
 
-function buildSendBody(
-  target: LinqTarget,
-  message: Record<string, unknown>,
-  fromPhone?: string,
-): Record<string, unknown> {
-  if (target.kind === "phone") {
-    if (!fromPhone?.trim()) {
-      throw new Error("Linq phone targets require fromPhone on the selected account");
-    }
-    return { from: fromPhone.trim(), to: [target.phone], message };
+async function mediaPart(
+  url: string,
+  token: string,
+  opts: LinqSendOpts,
+): Promise<Record<string, string>> {
+  if (/^https?:/i.test(url)) {
+    const remote = new URL(url);
+    if (remote.protocol !== "https:" || remote.username || remote.password)
+      throw new Error("Linq media requires a public HTTPS URL");
+    return { type: "media", url: remote.href };
   }
-  return { message };
+  const media = await loadWebMediaRaw(
+    url,
+    buildOutboundMediaLoadOptions({
+      maxBytes: 100 * 1024 * 1024,
+      mediaAccess: opts.mediaAccess,
+      mediaLocalRoots: opts.mediaLocalRoots,
+      mediaReadFile: opts.mediaReadFile,
+    }),
+  );
+  opts.signal?.throwIfAborted();
+  const upload = await apiRequest(
+    "/attachments",
+    token,
+    {
+      filename: media.fileName ?? "attachment",
+      content_type: media.contentType ?? "application/octet-stream",
+      size_bytes: media.buffer.length,
+    },
+    opts.signal,
+  );
+  if (
+    typeof upload.attachment_id !== "string" ||
+    typeof upload.upload_url !== "string" ||
+    upload.http_method !== "PUT" ||
+    new URL(upload.upload_url).protocol !== "https:"
+  )
+    throw new Error("Invalid Linq attachment upload response");
+  const { response, release } = await fetchWithSsrFGuard({
+    url: upload.upload_url,
+    init: {
+      method: "PUT",
+      headers: upload.required_headers,
+      body: new Uint8Array(media.buffer),
+      redirect: "error",
+    },
+    signal: opts.signal,
+    timeoutMs: 30_000,
+  });
+  try {
+    if (!response.ok)
+      throw new Error(
+        "Linq attachment upload failed (HTTP " + response.status + ")",
+      );
+    await response.body?.cancel();
+  } finally {
+    await release();
+  }
+  return { type: "media", attachment_id: upload.attachment_id };
 }
 
 export async function sendMessageLinq(
@@ -66,129 +151,112 @@ export async function sendMessageLinq(
   opts: LinqSendOpts = {},
 ): Promise<LinqSendResult> {
   const target = parseLinqTarget(to, opts.accountId ?? opts.account?.accountId);
-  const account =
-    opts.account && (!target.accountId || target.accountId === opts.account.accountId)
-      ? opts.account
-      : opts.config
-        ? resolveLinqAccount({ cfg: opts.config, accountId: target.accountId ?? opts.accountId })
-        : opts.account;
-
-  const parts: Array<Record<string, unknown>> = [];
-  if (text) {
-    parts.push({ type: "text", value: text });
-  }
-  if (opts.mediaUrl?.trim()) {
-    parts.push({ type: "media", url: opts.mediaUrl.trim() });
-  }
-  if (parts.length === 0) {
-    throw new Error("Linq send requires text or media");
-  }
-
-  const message: Record<string, unknown> = { parts };
-  if (opts.replyToMessageId?.trim()) {
-    message.reply_to = { message_id: opts.replyToMessageId.trim() };
-  }
-
-  if (target.kind === "group") {
+  if (target.kind === "group")
     throw new Error("Linq group sends are not enabled in this plugin version");
+  if (opts.accountId && target.accountId && opts.accountId !== target.accountId)
+    throw new Error("Linq target account does not match selected account");
+  if (
+    opts.account &&
+    target.accountId &&
+    opts.account.accountId !== target.accountId
+  )
+    throw new Error("Linq target account does not match selected account");
+  if (
+    opts.config &&
+    target.accountId &&
+    !listLinqAccountIds(opts.config).includes(target.accountId)
+  ) {
+    throw new Error("Unknown Linq account");
   }
-  const resolvedAccount = account;
-  const resolvedToken = opts.token?.trim() || resolvedAccount?.token;
-  if (!resolvedToken) {
-    throw new Error("Linq API token not configured");
-  }
-  const url = buildSendUrl(target, resolvedAccount?.fromPhone);
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${resolvedToken}`,
-    "Content-Type": "application/json",
-    "User-Agent": UA,
+  const account =
+    opts.account ??
+    (opts.config
+      ? resolveLinqAccount({ cfg: opts.config, accountId: target.accountId })
+      : undefined);
+  if (account && !account.enabled) throw new Error("Linq account is disabled");
+  const token = opts.token?.trim() || account?.token;
+  if (!token) throw new Error("Linq API token not configured");
+  if (target.kind === "phone" && !account?.fromPhone)
+    throw new Error(
+      "Linq phone targets require fromPhone on the selected account",
+    );
+  const parts: Record<string, string>[] = [];
+  if (text) parts.push({ type: "text", value: text });
+  if (opts.mediaUrl?.trim())
+    parts.push(await mediaPart(opts.mediaUrl.trim(), token, opts));
+  if (!parts.length) throw new Error("Linq send requires text or media");
+  const message = {
+    parts,
+    idempotency_key: opts.idempotencyKey ?? randomUUID(),
+    ...(opts.replyToMessageId
+      ? { reply_to: { message_id: opts.replyToMessageId, part_index: 0 } }
+      : {}),
   };
-  if (opts.idempotencyKey?.trim()) {
-    headers["Idempotency-Key"] = opts.idempotencyKey.trim();
-  }
-  const response = await fetchWithRetry(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(buildSendBody(target, message, resolvedAccount?.fromPhone)),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "");
-    throw new Error(`Linq API error: ${response.status} ${errorText.slice(0, 200)}`);
-  }
-
-  const data = (await response.json()) as {
-    id?: string;
-    chat_id?: string;
-    message_id?: string;
-    message?: { id?: string };
-    chat?: { id?: string };
-    trace_id?: string;
-  };
+  const data = await apiRequest(
+    target.kind === "phone"
+      ? "/chats"
+      : "/chats/" + encodeURIComponent(target.chatId) + "/messages",
+    token,
+    target.kind === "phone"
+      ? { from: account!.fromPhone, to: [target.phone], message }
+      : { message },
+    opts.signal,
+    async () => {
+      await opts.beforeSend?.();
+      opts.signal?.throwIfAborted();
+      opts.assertCurrent?.();
+    },
+  );
   const messageId =
-    data.message?.id ?? data.message_id ?? (data.chat_id && data.id ? data.id : "unknown");
+    data.message?.id ?? data.chat?.message?.id ?? data.message_id;
   const chatId =
     data.chat_id ??
     data.chat?.id ??
-    (target.kind === "phone" ? data.id : undefined) ??
-    (target.kind === "chat" ? target.chatId : "unknown");
+    (target.kind === "chat" ? target.chatId : undefined);
+  if (
+    typeof messageId !== "string" ||
+    !messageId ||
+    typeof chatId !== "string" ||
+    !chatId
+  ) {
+    throw new Error(
+      "Linq accepted the request without a usable receipt; delivery outcome is unknown",
+    );
+  }
   return {
     messageId,
     chatId,
     target: target.raw,
-    accountId: target.accountId ?? resolvedAccount?.accountId,
-    fromPhone: resolvedAccount?.fromPhone,
-    traceId: data.trace_id,
+    accountId: account?.accountId ?? target.accountId,
+    fromPhone: account?.fromPhone,
   };
 }
 
-/**
- * Fire-and-forget helper for side-effect API calls (typing, read receipts, reactions).
- * Swallows errors so callers don't need `.catch(() => {})` everywhere.
- */
-async function fireAndForget(url: string, init: RequestInit): Promise<boolean> {
+async function optionalAction(
+  chatId: string,
+  token: string,
+  action: "read" | "typing",
+  method = "POST",
+): Promise<boolean> {
   try {
-    const res = await fetch(url, init);
-    return res.ok;
+    const response = await fetch(
+      BASE + "/chats/" + encodeURIComponent(chatId) + "/" + action,
+      {
+        method,
+        headers: { Authorization: "Bearer " + token, "User-Agent": UA },
+        redirect: "error",
+        signal: AbortSignal.timeout(5000),
+      },
+    );
+    await response.body?.cancel();
+    return response.ok;
   } catch {
     return false;
   }
 }
-
-export async function startTypingLinq(chatId: string, token: string): Promise<boolean> {
-  return fireAndForget(`${LINQ_API_BASE}/chats/${encodeURIComponent(chatId)}/typing`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "User-Agent": UA },
-  });
-}
-
-export async function stopTypingLinq(chatId: string, token: string): Promise<boolean> {
-  return fireAndForget(`${LINQ_API_BASE}/chats/${encodeURIComponent(chatId)}/typing`, {
-    method: "DELETE",
-    headers: { Authorization: `Bearer ${token}`, "User-Agent": UA },
-  });
-}
-
-export async function markAsReadLinq(chatId: string, token: string): Promise<boolean> {
-  return fireAndForget(`${LINQ_API_BASE}/chats/${encodeURIComponent(chatId)}/read`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "User-Agent": UA },
-  });
-}
-
-export async function sendReactionLinq(
-  messageId: string,
-  type: "love" | "like" | "dislike" | "laugh" | "emphasize" | "question",
-  token: string,
-  operation: "add" | "remove" = "add",
-): Promise<boolean> {
-  return fireAndForget(`${LINQ_API_BASE}/messages/${encodeURIComponent(messageId)}/reactions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      "User-Agent": UA,
-    },
-    body: JSON.stringify({ operation, type }),
-  });
-}
+export const markAsReadLinq = (id: string, token: string) =>
+  optionalAction(id, token, "read");
+export const startTypingLinq = (id: string, token: string) =>
+  optionalAction(id, token, "typing");
+export const stopTypingLinq = (id: string, token: string) =>
+  optionalAction(id, token, "typing", "DELETE");

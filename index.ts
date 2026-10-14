@@ -1,16 +1,11 @@
-import type { ChannelPlugin, OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 import { linqPlugin } from "./src/channel.js";
 import { setLinqRuntime } from "./src/runtime.js";
 
-const plugin = {
+export default defineChannelPluginEntry({
   id: "linq",
   name: "Linq",
-  description: "Linq iMessage channel plugin — real iMessage over API, no Mac required",
-  configSchema: linqPlugin.configSchema,
-  register(api: OpenClawPluginApi) {
-    setLinqRuntime(api.runtime);
-    api.registerChannel({ plugin: linqPlugin as ChannelPlugin });
-  },
-};
-
-export default plugin;
+  description: "Hosted iMessage, RCS and SMS through Linq",
+  plugin: linqPlugin,
+  setRuntime: setLinqRuntime,
+});

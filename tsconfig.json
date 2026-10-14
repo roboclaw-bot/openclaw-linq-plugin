@@ -2,7 +2,7 @@
   "compilerOptions": {
     "allowImportingTsExtensions": true,
     "allowSyntheticDefaultImports": true,
-    "declaration": true,
+    "declaration": false,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "lib": ["DOM", "DOM.Iterable", "ES2023"],
@@ -16,6 +16,6 @@
     "strict": true,
     "target": "es2023"
   },
-  "include": ["index.ts", "src/**/*"],
+  "include": ["index.ts", "setup-entry.ts", "src/**/*.ts"],
   "exclude": ["node_modules", "dist", "**/*.test.ts"]
 }

@@ -1,10 +1,11 @@
 /** Linq Blue V3 webhook event envelope. */
 export type LinqWebhookEvent = {
-  api_version: "v3";
+  webhook_version?: string;
+  api_version?: "v3";
   event_id: string;
-  created_at: string;
-  trace_id: string;
-  partner_id: string;
+  created_at?: string;
+  trace_id?: string;
+  partner_id?: string;
   event_type: string;
   data: unknown;
 };
@@ -14,6 +15,7 @@ export type LinqMessageReceivedData = {
   from: string;
   recipient_phone: string;
   received_at: string;
+  is_group?: boolean;
   is_from_me: boolean;
   service: "iMessage" | "SMS" | "RCS";
   message: LinqIncomingMessage;
@@ -88,18 +90,11 @@ export type LinqAccountConfig = {
   /** Phone number this account sends from (E.164). */
   fromPhone?: string;
   /** DM security policy. */
-  dmPolicy?: "pairing" | "open" | "disabled";
+  dmPolicy?: "pairing" | "allowlist" | "open" | "disabled";
   /** Allowed sender IDs (phone numbers or "*"). */
   allowFrom?: Array<string | number>;
-  /** Group chat security policy. */
-  groupPolicy?: "open" | "allowlist" | "disabled";
-  /** Allowed group sender IDs. */
-  groupAllowFrom?: Array<string | number>;
-  /** Max media size in MB (default: 10). */
-  mediaMaxMb?: number;
-  /** Max text chunk length (default: 4000). */
-  textChunkLimit?: number;
   /** Webhook URL for inbound messages from Linq. */
+  inboundEnabled?: boolean;
   webhookUrl?: string;
   /** Webhook HMAC signing secret or SecretRef-backed secret. */
   webhookSecret?: string | LinqSecretRef;
@@ -107,12 +102,6 @@ export type LinqAccountConfig = {
   webhookPath?: string;
   /** Deprecated: OpenClaw owns plugin route binding. */
   webhookHost?: string;
-  /** History limit for group chats. */
-  historyLimit?: number;
-  /** Block streaming responses. */
-  blockStreaming?: boolean;
-  /** Group configs keyed by chat_id. */
-  groups?: Record<string, unknown>;
   /** Per-account sub-accounts. */
   accounts?: Record<string, LinqAccountConfig>;
   /** Preferred default account id. */

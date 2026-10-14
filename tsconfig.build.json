@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": false,
+    "noEmit": false,
+    "rootDir": "."
+  },
+  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+}

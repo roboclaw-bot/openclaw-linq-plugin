@@ -31,7 +31,9 @@ describe("Linq webhook subscriptions", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(listLinqWebhookSubscriptions("token")).resolves.toHaveLength(1);
+    await expect(listLinqWebhookSubscriptions("token")).resolves.toHaveLength(
+      1,
+    );
     expect(fetchMock).toHaveBeenCalledWith(
       "https://api.linqapp.com/api/partner/v3/webhook-subscriptions",
       expect.objectContaining({
@@ -65,7 +67,7 @@ describe("Linq webhook subscriptions", () => {
     ).toBeUndefined();
   });
 
-  it("treats unfiltered subscriptions as covering the selected phone number", () => {
+  it("does not adopt account-wide subscriptions for a selected line", () => {
     const subscription = {
       id: "sub_1",
       is_active: true,
@@ -80,7 +82,7 @@ describe("Linq webhook subscriptions", () => {
         "https://agent.example.com/linq-webhook",
         "+15551112222",
       ),
-    ).toBe(subscription);
+    ).toBeUndefined();
   });
 
   it("ignores inactive subscriptions and subscriptions missing inbound events", () => {
@@ -190,66 +192,23 @@ describe("Linq webhook subscriptions", () => {
     expect(created.signing_secret).toBe("secret_1");
   });
 
-  it("retries subscription creation without phone filter when Linq rejects phone scope", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
+  it("does not widen phone scope after a provider permission denial", async () => {
+    const fetchMock = vi.fn(
+      async () =>
         new Response(
-          JSON.stringify({
-            error: {
-              code: 2006,
-              message: "You do not have permission to send from this phone number",
-              status: 403,
-            },
-            success: false,
-          }),
+          JSON.stringify({ error: { code: 2006, message: "private error" } }),
           { status: 403 },
         ),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            id: "sub_2",
-            is_active: true,
-            subscribed_events: ["message.received"],
-            target_url: "https://agent.example.com/linq-webhook",
-            phone_numbers: null,
-            signing_secret: "secret_1",
-          }),
-          { status: 201 },
-        ),
-      );
+    );
     vi.stubGlobal("fetch", fetchMock);
-
     await expect(
       createLinqWebhookSubscription({
         token: "token",
         targetUrl: "https://agent.example.com/linq-webhook",
         phoneNumber: "+15551112222",
       }),
-    ).resolves.toMatchObject({ id: "sub_2", phone_numbers: null });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      1,
-      "https://api.linqapp.com/api/partner/v3/webhook-subscriptions",
-      expect.objectContaining({
-        body: JSON.stringify({
-          subscribed_events: ["message.received"],
-          target_url: "https://agent.example.com/linq-webhook",
-          phone_numbers: ["+15551112222"],
-        }),
-      }),
-    );
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      2,
-      "https://api.linqapp.com/api/partner/v3/webhook-subscriptions",
-      expect.objectContaining({
-        body: JSON.stringify({
-          subscribed_events: ["message.received"],
-          target_url: "https://agent.example.com/linq-webhook",
-        }),
-      }),
-    );
+    ).rejects.toThrow("HTTP 403");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("deletes webhook subscriptions by id", async () => {
@@ -259,7 +218,10 @@ describe("Linq webhook subscriptions", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(
-      deleteLinqWebhookSubscription({ token: "token", subscriptionId: "sub_1" }),
+      deleteLinqWebhookSubscription({
+        token: "token",
+        subscriptionId: "sub_1",
+      }),
     ).resolves.toBeUndefined();
     expect(fetchMock).toHaveBeenCalledWith(
       "https://api.linqapp.com/api/partner/v3/webhook-subscriptions/sub_1",
@@ -273,7 +235,10 @@ describe("Linq webhook subscriptions", () => {
 
 describe("Linq secret contract", () => {
   it("declares API token and webhook signing secret as configurable secret targets", () => {
-    const ids = linqPlugin.secrets?.secretTargetRegistryEntries?.map((entry) => entry.id) ?? [];
+    const ids =
+      linqPlugin.secrets?.secretTargetRegistryEntries?.map(
+        (entry) => entry.id,
+      ) ?? [];
 
     expect(ids).toContain("channels.linq.apiToken");
     expect(ids).toContain("channels.linq.webhookSecret");

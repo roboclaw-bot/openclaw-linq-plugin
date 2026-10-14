@@ -17,7 +17,9 @@ class LinqApiError extends Error {
   readonly code?: number;
 
   constructor(params: { status: number; body: string; code?: number }) {
-    super(`Linq API ${params.status}: ${params.body.slice(0, 200)}`);
+    super(
+      `Linq API request failed (HTTP ${params.status}${params.code ? `, code ${params.code}` : ""})`,
+    );
     this.name = "LinqApiError";
     this.status = params.status;
     this.code = params.code;
@@ -40,6 +42,8 @@ async function fetchLinq(
 ): Promise<Response> {
   const response = await fetch(`${LINQ_API_BASE}${path}`, {
     ...init,
+    redirect: "error",
+    signal: init.signal ?? AbortSignal.timeout(30_000),
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
@@ -52,7 +56,8 @@ async function fetchLinq(
     let code: number | undefined;
     try {
       const parsed = JSON.parse(text) as { error?: { code?: unknown } };
-      code = typeof parsed.error?.code === "number" ? parsed.error.code : undefined;
+      code =
+        typeof parsed.error?.code === "number" ? parsed.error.code : undefined;
     } catch {
       // Non-JSON error bodies still carry the HTTP status and truncated body.
     }
@@ -61,11 +66,9 @@ async function fetchLinq(
   return response;
 }
 
-function isPhoneNumberPermissionError(err: unknown): boolean {
-  return err instanceof LinqApiError && err.status === 403 && err.code === 2006;
-}
-
-function hasInboundWebhookEvents(subscription: LinqWebhookSubscription): boolean {
+function hasInboundWebhookEvents(
+  subscription: LinqWebhookSubscription,
+): boolean {
   return LINQ_INBOUND_WEBHOOK_EVENTS.every((event) =>
     subscription.subscribed_events.includes(event),
   );
@@ -92,16 +95,15 @@ function matchesWebhookSubscription(params: {
     return true;
   }
   const phoneNumbers = subscription.phone_numbers ?? [];
-  return phoneNumbers.length === 0 || phoneNumbers.includes(expectedPhone);
+  return phoneNumbers.length === 1 && phoneNumbers[0] === expectedPhone;
 }
 
 export async function listLinqWebhookSubscriptions(
   token: string,
 ): Promise<LinqWebhookSubscription[]> {
-  const data = await fetchLinqJson<{ subscriptions?: LinqWebhookSubscription[] }>(
-    token,
-    "/webhook-subscriptions",
-  );
+  const data = await fetchLinqJson<{
+    subscriptions?: LinqWebhookSubscription[];
+  }>(token, "/webhook-subscriptions");
   return data.subscriptions ?? [];
 }
 
@@ -142,14 +144,12 @@ export function findReplaceableLinqWebhookSubscriptions(
     if (!candidateUrls.has(subscription.target_url)) {
       return false;
     }
-    if (subscription.target_url === targetUrl) {
-      return true;
-    }
-    if (!previousPhoneNumber) {
-      return true;
-    }
     const phones = subscription.phone_numbers ?? [];
-    return phones.length === 0 || phones.includes(previousPhoneNumber);
+    return (
+      phones.length === 1 &&
+      Boolean(phones[0]) &&
+      (phones[0] === phoneNumber || phones[0] === previousPhoneNumber)
+    );
   });
 }
 
@@ -160,27 +160,26 @@ export async function createLinqWebhookSubscription(params: {
   subscribedEvents?: readonly string[];
 }): Promise<LinqWebhookSubscription> {
   const body = {
-    subscribed_events: [...(params.subscribedEvents ?? LINQ_INBOUND_WEBHOOK_EVENTS)],
+    subscribed_events: [
+      ...(params.subscribedEvents ?? LINQ_INBOUND_WEBHOOK_EVENTS),
+    ],
     target_url: params.targetUrl,
-    ...(params.phoneNumber?.trim() ? { phone_numbers: [params.phoneNumber.trim()] } : {}),
+    ...(params.phoneNumber?.trim()
+      ? { phone_numbers: [params.phoneNumber.trim()] }
+      : {}),
   };
-  try {
-    return await fetchLinqJson<LinqWebhookSubscription>(params.token, "/webhook-subscriptions", {
+  if (!params.phoneNumber?.trim())
+    throw new Error(
+      "A Linq sender phone number is required; account-wide subscriptions are not created",
+    );
+  return fetchLinqJson<LinqWebhookSubscription>(
+    params.token,
+    "/webhook-subscriptions",
+    {
       method: "POST",
       body: JSON.stringify(body),
-    });
-  } catch (err) {
-    if (!params.phoneNumber?.trim() || !isPhoneNumberPermissionError(err)) {
-      throw err;
-    }
-    return fetchLinqJson<LinqWebhookSubscription>(params.token, "/webhook-subscriptions", {
-      method: "POST",
-      body: JSON.stringify({
-        subscribed_events: body.subscribed_events,
-        target_url: body.target_url,
-      }),
-    });
-  }
+    },
+  );
 }
 
 export async function deleteLinqWebhookSubscription(params: {

@@ -1,102 +1,89 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { createLinqWebhookHandler, createMemoryLinqWebhookDedupeStore } from "./webhook.js";
-
-const event = {
-  api_version: "v3",
-  event_id: "evt_1",
-  created_at: "2026-06-04T12:00:00Z",
-  trace_id: "trace_1",
-  partner_id: "partner_1",
-  event_type: "message.received",
-  data: {},
-};
-
-function signedHeaders(secret: string, body: string, timestamp: string) {
+import { createLinqWebhookHandler } from "./webhook.js";
+const key = Buffer.alloc(32, 7);
+const secret = "whsec_" + key.toString("base64");
+const body = Buffer.from(
+  JSON.stringify({ event_id: "e1", event_type: "message.received", data: {} }),
+);
+function request(bytes = body, timestamp = "1000") {
   return {
-    "x-webhook-timestamp": timestamp,
-    "x-webhook-signature": createHmac("sha256", secret)
-      .update(`${timestamp}.${body}`)
-      .digest("hex"),
+    method: "POST",
+    path: "/linq",
+    body: bytes,
+    headers: {
+      "webhook-id": "d1",
+      "webhook-timestamp": timestamp,
+      "webhook-signature":
+        "v1," +
+        createHmac("sha256", key)
+          .update("d1." + timestamp + ".")
+          .update(bytes)
+          .digest("base64"),
+    },
   };
 }
-
-describe("createLinqWebhookHandler", () => {
-  it("rejects invalid method, oversized body, malformed JSON, and missing event_id", async () => {
-    const handle = createLinqWebhookHandler({ path: "/linq", maxBytes: 8 });
-    await expect(handle({ method: "GET", path: "/linq", headers: {}, body: "" })).resolves.toMatchObject({
-      status: 405,
-    });
-    await expect(
-      handle({ method: "POST", path: "/linq", headers: {}, body: "012345678" }),
-    ).resolves.toMatchObject({ status: 413 });
-
-    const parseHandle = createLinqWebhookHandler({ path: "/linq" });
-    await expect(
-      parseHandle({ method: "POST", path: "/linq", headers: {}, body: "{" }),
-    ).resolves.toMatchObject({ status: 400, body: "malformed json" });
-    await expect(
-      parseHandle({ method: "POST", path: "/linq", headers: {}, body: "{}" }),
-    ).resolves.toMatchObject({ status: 400, body: "missing event_id" });
+const handle = createLinqWebhookHandler({
+  path: "/linq",
+  secret,
+  now: () => 1_000_000,
+});
+describe("Standard Webhooks authentication", () => {
+  it("requires a secret and authenticates exact bytes", async () => {
+    expect(() =>
+      createLinqWebhookHandler({ path: "/linq", secret: "" }),
+    ).toThrow();
+    expect((await handle(request())).status).toBe(200);
+    expect(
+      (
+        await handle({
+          ...request(),
+          body: Buffer.concat([body, Buffer.from(" ")]),
+        })
+      ).status,
+    ).toBe(401);
   });
-
-  it("verifies signatures and rejects stale timestamps", async () => {
-    const secret = "shh";
-    const body = JSON.stringify(event);
-    const handle = createLinqWebhookHandler({
+  it("rejects missing, duplicate, stale and legacy-only headers", async () => {
+    expect((await handle({ ...request(), headers: {} })).status).toBe(401);
+    expect((await handle(request(body, "1"))).status).toBe(401);
+    expect(
+      (
+        await handle({
+          ...request(),
+          headers: { ...request().headers, "webhook-id": ["d1", "d1"] },
+        })
+      ).status,
+    ).toBe(401);
+    expect(
+      (
+        await handle({
+          ...request(),
+          headers: {
+            "x-webhook-signature": "legacy",
+            "x-webhook-timestamp": "1000",
+          },
+        })
+      ).status,
+    ).toBe(401);
+  });
+  it("allows rotated signatures but never unsigned parsing", async () => {
+    const req = request();
+    req.headers["webhook-signature"] =
+      "v1,invalid " + req.headers["webhook-signature"];
+    expect((await handle(req)).status).toBe(200);
+    for (const invalid of ["null", "[]", "{}", "{"])
+      expect((await handle(request(Buffer.from(invalid)))).status).toBe(400);
+  });
+  it("bounds bodies and methods; retries retain the event for durable dedupe", async () => {
+    expect((await handle({ ...request(), method: "GET" })).status).toBe(405);
+    expect((await handle({ ...request(), path: "/other" })).status).toBe(404);
+    const small = createLinqWebhookHandler({
       path: "/linq",
       secret,
-      now: () => 1_000_000,
-      replayWindowSeconds: 300,
+      maxBytes: 8,
     });
-
-    await expect(
-      handle({ method: "POST", path: "/linq", headers: {}, body }),
-    ).resolves.toMatchObject({ status: 401, body: "missing signature" });
-    await expect(
-      handle({
-        method: "POST",
-        path: "/linq",
-        headers: signedHeaders(secret, body, "1"),
-        body,
-      }),
-    ).resolves.toMatchObject({ status: 401, body: "stale timestamp" });
-    await expect(
-      handle({
-        method: "POST",
-        path: "/linq",
-        headers: signedHeaders(secret, body, "1000"),
-        body: JSON.stringify({ ...event, event_id: "evt_2" }),
-      }),
-    ).resolves.toMatchObject({ status: 401, body: "invalid signature" });
-    await expect(
-      handle({
-        method: "POST",
-        path: "/linq",
-        headers: signedHeaders(secret, body, "1000"),
-        body,
-      }),
-    ).resolves.toMatchObject({ status: 200, event });
-  });
-
-  it("acknowledges duplicate event_id values without returning an event", async () => {
-    const store = createMemoryLinqWebhookDedupeStore();
-    const handle = createLinqWebhookHandler({ path: "/linq", dedupeStore: store });
-    const first = await handle({
-      method: "POST",
-      path: "/linq",
-      headers: {},
-      body: JSON.stringify(event),
-    });
-    expect(first).toMatchObject({ status: 200, event });
-    expect(first.duplicate).toBeUndefined();
-    const duplicate = await handle({
-      method: "POST",
-      path: "/linq",
-      headers: {},
-      body: JSON.stringify(event),
-    });
-    expect(duplicate).toMatchObject({ status: 200, duplicate: true });
-    expect(duplicate.event).toBeUndefined();
+    expect((await small(request())).status).toBe(413);
+    expect((await handle(request())).event?.event_id).toBe("e1");
+    expect((await handle(request())).event?.event_id).toBe("e1");
   });
 });

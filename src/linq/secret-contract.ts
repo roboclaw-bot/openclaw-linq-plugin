@@ -1,17 +1,17 @@
-import { hasOwnProperty } from "openclaw/plugin-sdk/channel-secret-runtime";
+import { hasOwnProperty } from "openclaw/plugin-sdk/channel-secret-basic-runtime";
 import {
   collectConditionalChannelFieldAssignments,
   getChannelSurface,
   type ResolverContext,
   type SecretDefaults,
   type SecretTargetRegistryEntry,
-} from "openclaw/plugin-sdk/channel-secret-runtime";
-import type { OpenClawConfig } from "openclaw/plugin-sdk";
+} from "openclaw/plugin-sdk/channel-secret-basic-runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 
 const secretFields = ["apiToken", "webhookSecret"] as const;
 
-export const linqSecretTargetRegistryEntries: SecretTargetRegistryEntry[] = secretFields.flatMap(
-  (field) => [
+export const linqSecretTargetRegistryEntries: SecretTargetRegistryEntry[] =
+  secretFields.flatMap((field) => [
     {
       id: `channels.linq.accounts.*.${field}`,
       targetType: `channels.linq.accounts.*.${field}`,
@@ -34,8 +34,7 @@ export const linqSecretTargetRegistryEntries: SecretTargetRegistryEntry[] = secr
       includeInConfigure: true,
       includeInAudit: true,
     },
-  ],
-);
+  ]);
 
 export function collectLinqRuntimeConfigAssignments(params: {
   config: OpenClawConfig;
@@ -55,12 +54,20 @@ export function collectLinqRuntimeConfigAssignments(params: {
       surface,
       defaults: params.defaults,
       context: params.context,
-      topLevelActiveWithoutAccounts: true,
+      topLevelActiveWithoutAccounts:
+        field !== "webhookSecret" || linq.inboundEnabled !== false,
       topLevelInheritedAccountActive: ({ account, enabled }) =>
-        enabled && !hasOwnProperty(account, field),
-      accountActive: ({ enabled }) => enabled,
+        enabled &&
+        !hasOwnProperty(account, field) &&
+        (field !== "apiToken" || !hasOwnProperty(account, "tokenFile")) &&
+        (field !== "webhookSecret" ||
+          (account.inboundEnabled ?? linq.inboundEnabled) !== false),
+      accountActive: ({ account, enabled }) =>
+        enabled &&
+        (field !== "webhookSecret" ||
+          (account.inboundEnabled ?? linq.inboundEnabled) !== false),
       topInactiveReason: `no enabled Linq surface inherits this top-level ${field}.`,
-      accountInactiveReason: "Linq account is disabled.",
+      accountInactiveReason: "Linq account or inbound webhook is disabled.",
     });
   }
 }

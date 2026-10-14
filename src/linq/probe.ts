@@ -4,7 +4,7 @@ const LINQ_API_BASE = "https://api.linqapp.com/api/partner/v3";
 
 export async function probeLinq(
   token?: string,
-  timeoutMs?: number,
+  timeoutMs = 5000,
 ): Promise<LinqProbe> {
   const resolvedToken = token?.trim() ?? "";
   if (!resolvedToken) {
@@ -13,17 +13,27 @@ export async function probeLinq(
 
   const url = `${LINQ_API_BASE}/phone_numbers`;
   const controller = new AbortController();
-  const timer = timeoutMs && timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  const timer =
+    timeoutMs && timeoutMs > 0
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : null;
 
   try {
     const response = await fetch(url, {
       method: "GET",
-      headers: { Authorization: `Bearer ${resolvedToken}`, "User-Agent": "OpenClaw-Linq/1.0" },
+      headers: {
+        Authorization: `Bearer ${resolvedToken}`,
+        "User-Agent": "OpenClaw-Linq/1.0",
+      },
       signal: controller.signal,
+      redirect: "error",
     });
     if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      return { ok: false, error: `Linq API ${response.status}: ${text.slice(0, 200)}` };
+      await response.body?.cancel();
+      return {
+        ok: false,
+        error: `Linq API request failed (HTTP ${response.status})`,
+      };
     }
     const data = (await response.json()) as {
       phone_numbers?: Array<{ phone_number?: string }>;

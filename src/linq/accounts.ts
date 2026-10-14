@@ -1,8 +1,11 @@
 import { readFileSync } from "node:fs";
-import type { OpenClawConfig } from "openclaw/plugin-sdk";
-import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "openclaw/plugin-sdk/core";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
+import {
+  DEFAULT_ACCOUNT_ID,
+  normalizeAccountId,
+} from "openclaw/plugin-sdk/core";
 import { normalizeResolvedSecretInputString } from "openclaw/plugin-sdk/secret-input";
-import type { LinqAccountConfig, LinqSecretRef } from "./types.js";
+import type { LinqAccountConfig } from "./types.js";
 
 export type ResolvedLinqAccount = {
   accountId: string;
@@ -17,9 +20,8 @@ export type ResolvedLinqAccount = {
 };
 
 function listConfiguredAccountIds(cfg: OpenClawConfig): string[] {
-  const accounts = (cfg.channels as Record<string, unknown> | undefined)?.linq as
-    | LinqAccountConfig
-    | undefined;
+  const accounts = (cfg.channels as Record<string, unknown> | undefined)
+    ?.linq as LinqAccountConfig | undefined;
   if (!accounts?.accounts || typeof accounts.accounts !== "object") {
     return [];
   }
@@ -27,27 +29,24 @@ function listConfiguredAccountIds(cfg: OpenClawConfig): string[] {
 }
 
 export function listLinqAccountIds(cfg: OpenClawConfig): string[] {
-  const linqSection = (cfg.channels as Record<string, unknown> | undefined)?.linq as
-    | LinqAccountConfig
-    | undefined;
+  const linqSection = (cfg.channels as Record<string, unknown> | undefined)
+    ?.linq as LinqAccountConfig | undefined;
   const ids = listConfiguredAccountIds(cfg);
-  const defaultAccount = linqSection?.defaultAccount?.trim();
   if (ids.length === 0) {
     return [DEFAULT_ACCOUNT_ID];
-  }
-  if (defaultAccount && !ids.includes(defaultAccount)) {
-    ids.push(defaultAccount);
   }
   return ids.toSorted((a, b) => a.localeCompare(b));
 }
 
 export function resolveDefaultLinqAccountId(cfg: OpenClawConfig): string {
-  const linqSection = (cfg.channels as Record<string, unknown> | undefined)?.linq as
-    | LinqAccountConfig
-    | undefined;
+  const linqSection = (cfg.channels as Record<string, unknown> | undefined)
+    ?.linq as LinqAccountConfig | undefined;
   const configured = linqSection?.defaultAccount?.trim();
   if (configured) {
-    return normalizeAccountId(configured);
+    const id = normalizeAccountId(configured);
+    if (!listLinqAccountIds(cfg).includes(id))
+      throw new Error("Linq defaultAccount must name a configured account");
+    return id;
   }
   const ids = listLinqAccountIds(cfg);
   if (ids.includes(DEFAULT_ACCOUNT_ID)) {
@@ -60,40 +59,40 @@ function resolveAccountConfig(
   cfg: OpenClawConfig,
   accountId: string,
 ): LinqAccountConfig | undefined {
-  const linqSection = (cfg.channels as Record<string, unknown> | undefined)?.linq as
-    | LinqAccountConfig
-    | undefined;
+  const linqSection = (cfg.channels as Record<string, unknown> | undefined)
+    ?.linq as LinqAccountConfig | undefined;
   if (!linqSection?.accounts || typeof linqSection.accounts !== "object") {
     return undefined;
   }
   return linqSection.accounts[accountId];
 }
 
-function mergeLinqAccountConfig(cfg: OpenClawConfig, accountId: string): LinqAccountConfig {
-  const linqSection = (cfg.channels as Record<string, unknown> | undefined)?.linq as
-    | (LinqAccountConfig & { accounts?: unknown })
-    | undefined;
+function mergeLinqAccountConfig(
+  cfg: OpenClawConfig,
+  accountId: string,
+): LinqAccountConfig {
+  const linqSection = (cfg.channels as Record<string, unknown> | undefined)
+    ?.linq as (LinqAccountConfig & { accounts?: unknown }) | undefined;
   const { accounts: _ignored, ...base } = linqSection ?? {};
   const account = resolveAccountConfig(cfg, accountId) ?? {};
+  // Explicit account credentials select a source, not a blend with the base account.
+  if (account.apiToken !== undefined || account.tokenFile !== undefined) {
+    delete base.apiToken;
+    delete base.tokenFile;
+  }
   return { ...base, ...account };
 }
 
 function resolveToken(
   merged: LinqAccountConfig,
   accountId: string,
-): { token: string; source: "config" | "env" | "file" | "secretRef" } | { token: ""; source: "none" } {
-  const envToken = process.env.LINQ_API_TOKEN?.trim() ?? "";
-  if (envToken && accountId === DEFAULT_ACCOUNT_ID) {
-    return { token: envToken, source: "env" };
-  }
+):
+  | { token: string; source: "config" | "env" | "file" | "secretRef" }
+  | { token: ""; source: "none" } {
   const apiTokenPath =
     accountId === DEFAULT_ACCOUNT_ID
       ? "channels.linq.apiToken"
       : `channels.linq.accounts.${accountId}.apiToken`;
-  const refToken = resolveLocalSecretRef(secretRefFromValue(merged.apiToken));
-  if (refToken) {
-    return { token: refToken.token, source: refToken.source };
-  }
   const resolvedInput = normalizeResolvedSecretInputString({
     value: merged.apiToken,
     path: apiTokenPath,
@@ -108,64 +107,30 @@ function resolveToken(
         return { token: content, source: "file" };
       }
     } catch {
-      // fall through
+      throw new Error("Linq tokenFile could not be read");
     }
+    throw new Error("Linq tokenFile is empty");
   }
-  return { token: "", source: "none" };
-}
-
-function secretRefFromValue(value: unknown): LinqSecretRef | undefined {
-  if (!value || typeof value !== "object") {
-    return undefined;
-  }
-  const record = value as Partial<LinqSecretRef>;
-  if (
-    (record.source === "env" || record.source === "file" || record.source === "exec") &&
-    typeof record.id === "string" &&
-    record.id.trim()
-  ) {
-    return {
-      source: record.source,
-      provider: typeof record.provider === "string" ? record.provider : undefined,
-      id: record.id,
-    };
-  }
-  return undefined;
-}
-
-function resolveLocalSecretRef(
-  ref: LinqSecretRef | undefined,
-): { token: string; source: "env" | "file" | "secretRef" } | null {
-  if (!ref?.id?.trim()) {
-    return null;
-  }
-  if (ref.source === "env") {
-    const token = process.env[ref.id.trim()]?.trim() ?? "";
-    return token ? { token, source: "env" } : null;
-  }
-  if (ref.source === "file") {
-    try {
-      const token = readFileSync(ref.id.trim(), "utf8").trim();
-      return token ? { token, source: "file" } : null;
-    } catch {
-      return null;
-    }
-  }
-  return null;
+  const envToken =
+    accountId === DEFAULT_ACCOUNT_ID
+      ? process.env.LINQ_API_TOKEN?.trim()
+      : undefined;
+  return envToken
+    ? { token: envToken, source: "env" }
+    : { token: "", source: "none" };
 }
 
 function resolveWebhookSecret(
   accountId: string,
   merged: LinqAccountConfig,
-): { secret: string; source: "config" | "env" | "file" | "secretRef" } | { secret: ""; source: "none" } {
+):
+  | { secret: string; source: "config" | "env" | "file" | "secretRef" }
+  | { secret: ""; source: "none" } {
+  if (merged.inboundEnabled === false) return { secret: "", source: "none" };
   const webhookSecretPath =
     accountId === DEFAULT_ACCOUNT_ID
       ? "channels.linq.webhookSecret"
       : `channels.linq.accounts.${accountId}.webhookSecret`;
-  const refSecret = resolveLocalSecretRef(secretRefFromValue(merged.webhookSecret));
-  if (refSecret) {
-    return { secret: refSecret.token, source: refSecret.source };
-  }
   const resolvedInput = normalizeResolvedSecretInputString({
     value: merged.webhookSecret,
     path: webhookSecretPath,
@@ -180,10 +145,12 @@ export function resolveLinqAccount(params: {
   cfg: OpenClawConfig;
   accountId?: string | null;
 }): ResolvedLinqAccount {
-  const accountId = normalizeAccountId(params.accountId);
-  const linqSection = (params.cfg.channels as Record<string, unknown> | undefined)?.linq as
-    | LinqAccountConfig
-    | undefined;
+  const accountId = normalizeAccountId(
+    params.accountId ?? resolveDefaultLinqAccountId(params.cfg),
+  );
+  const linqSection = (
+    params.cfg.channels as Record<string, unknown> | undefined
+  )?.linq as LinqAccountConfig | undefined;
   const baseEnabled = linqSection?.enabled !== false;
   const merged = mergeLinqAccountConfig(params.cfg, accountId);
   const accountEnabled = merged.enabled !== false;
@@ -203,7 +170,7 @@ export function resolveLinqAccount(params: {
 }
 
 function isUnresolvedSecretRefError(err: unknown): boolean {
-  return err instanceof Error && /unresolved SecretRef/.test(err.message);
+  return err instanceof Error && /SecretRef/.test(err.message);
 }
 
 function resolveTokenForStatus(
@@ -214,7 +181,7 @@ function resolveTokenForStatus(
     return resolveToken(merged, accountId);
   } catch (err) {
     if (isUnresolvedSecretRefError(err)) {
-      return { token: "", source: "none" };
+      return { token: "", source: "secretRef" };
     }
     throw err;
   }
@@ -228,7 +195,7 @@ function resolveWebhookSecretForStatus(
     return resolveWebhookSecret(accountId, merged);
   } catch (err) {
     if (isUnresolvedSecretRefError(err)) {
-      return { secret: "", source: "none" };
+      return { secret: "", source: "secretRef" };
     }
     throw err;
   }
@@ -238,10 +205,12 @@ export function resolveLinqAccountForStatus(params: {
   cfg: OpenClawConfig;
   accountId?: string | null;
 }): ResolvedLinqAccount {
-  const accountId = normalizeAccountId(params.accountId);
-  const linqSection = (params.cfg.channels as Record<string, unknown> | undefined)?.linq as
-    | LinqAccountConfig
-    | undefined;
+  const accountId = normalizeAccountId(
+    params.accountId ?? resolveDefaultLinqAccountId(params.cfg),
+  );
+  const linqSection = (
+    params.cfg.channels as Record<string, unknown> | undefined
+  )?.linq as LinqAccountConfig | undefined;
   const baseEnabled = linqSection?.enabled !== false;
   const merged = mergeLinqAccountConfig(params.cfg, accountId);
   const accountEnabled = merged.enabled !== false;
