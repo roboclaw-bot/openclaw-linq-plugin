@@ -11,7 +11,7 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 const stage = process.argv[2];
 if (!stage) {
   const home = await mkdtemp(path.join(tmpdir(), "linq-proof-"));
-  for (const phase of ["package", "setup", "admit", "recover", "policy"]) {
+  for (const phase of ["package", "setup", "secrets", "admit", "recover", "policy"]) {
     const result = spawnSync(
       process.execPath,
       [fileURLToPath(import.meta.url), phase],
@@ -72,7 +72,7 @@ if (!stage) {
       allow: ["linq"],
       entries: { linq: { enabled: true } },
       load: {
-        paths: [["package", "setup"].includes(stage) ? pluginRoot : fixture],
+        paths: [["package", "setup", "secrets"].includes(stage) ? pluginRoot : fixture],
       },
     },
     channels: {
@@ -86,6 +86,30 @@ if (!stage) {
     },
   };
   if (stage === "setup") cfg.channels = {};
+  if (stage === "secrets") {
+    await readFile(path.join(pluginRoot, "dist/secret-contract-api.js"));
+    cfg.channels.linq.apiToken = { source: "env", provider: "default", id: "LINQ_PROOF_TOKEN" };
+    cfg.channels.linq.webhookSecret = { source: "env", provider: "default", id: "LINQ_PROOF_WEBHOOK" };
+    cfg.channels.linq.inboundEnabled = true;
+    // The pinned host's private harness boundary; plugin code uses only public SDKs.
+    let prepare;
+    for (const name of await readdir(dist)) {
+      if (!name.endsWith(".mjs")) continue;
+      const source = await readFile(path.join(dist, name), "utf8");
+      if (!source.includes("async function prepareSecretsRuntimeSnapshot(")) continue;
+      prepare = Object.values(await import(pathToFileURL(path.join(dist, name)))).find(
+        (value) => typeof value === "function" && value.name === "prepareSecretsRuntimeSnapshot",
+      );
+      if (prepare) break;
+    }
+    assert(prepare, "pinned host secrets runtime must be present");
+    const snapshot = await prepare({ config: cfg, env: { ...process.env, LINQ_PROOF_TOKEN: "fixture-token", LINQ_PROOF_WEBHOOK: "fixture-webhook" }, includeAuthStoreRefs: false });
+    assert.equal(snapshot.config.channels.linq.apiToken, "fixture-token");
+    assert.equal(snapshot.config.channels.linq.webhookSecret, "fixture-webhook");
+    assert.equal(cfg.channels.linq.apiToken.source, "env", "source config retains SecretRef");
+    console.log("PASS packed pre-runtime SecretRef discovery and materialization");
+    process.exit(0);
+  }
   const registry = loader({
     config: cfg,
     ...(stage === "setup"

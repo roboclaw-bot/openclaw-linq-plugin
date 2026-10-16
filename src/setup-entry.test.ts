@@ -11,6 +11,16 @@ vi.mock("./runtime.js", () => {
 });
 
 describe("Linq setup entry import boundary", () => {
+  it("publishes the host-discoverable secret contract without transport imports", async () => {
+    const contract = await import("../secret-contract-api.js");
+    expect(contract.collectRuntimeConfigAssignments).toBeTypeOf("function");
+    expect(contract.secretTargetRegistryEntries.map((entry) => entry.id)).toEqual([
+      "channels.linq.accounts.*.apiToken",
+      "channels.linq.apiToken",
+      "channels.linq.accounts.*.webhookSecret",
+      "channels.linq.webhookSecret",
+    ]);
+  });
   it("loads setup/config surfaces without runtime-only modules", async () => {
     const { default: entry } = await import("../setup-entry.js");
 

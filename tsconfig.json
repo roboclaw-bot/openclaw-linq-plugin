@@ -16,6 +16,6 @@
     "strict": true,
     "target": "es2023"
   },
-  "include": ["index.ts", "setup-entry.ts", "src/**/*.ts"],
+  "include": ["index.ts", "setup-entry.ts", "secret-contract-api.ts", "src/**/*.ts"],
   "exclude": ["node_modules", "dist", "**/*.test.ts"]
 }
